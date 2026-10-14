@@ -11,11 +11,19 @@ abstract class IVideoDetector {
   /// Submits a candidate URL for detection.
   ///
   /// Returns true when accepted and emitted.
+  ///
+  /// Optional metadata ([title], [contentLength], [qualityLabel]) may be
+  /// supplied when the call site already has richer information (e.g. from
+  /// a DOM scan). When the URL is already known, the implementation should
+  /// *merge* the new metadata rather than silently dropping the call.
   bool handleUrl(
     String url, {
     Map<String, String>? headers,
     String? contentType,
     String source = 'intercept',
+    String? title,
+    int? contentLength,
+    String? qualityLabel,
   });
 
   /// Submits a user-entered URL for validation/detection.

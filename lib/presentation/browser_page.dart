@@ -4,26 +4,29 @@ import 'dart:convert';
 import 'package:downloader/domain/detect_video_use_case.dart';
 import 'package:downloader/domain/download_request.dart';
 import 'package:downloader/domain/download_video_use_case.dart';
+import 'package:downloader/domain/i_receive_share_gateway.dart';
 import 'package:downloader/domain/i_video_detector.dart';
 import 'package:downloader/domain/video_url_matcher.dart';
 import 'package:downloader/presentation/widgets/address_bar.dart';
 import 'package:downloader/presentation/widgets/animated_download_fab.dart';
 import 'package:downloader/presentation/widgets/download_progress_bar.dart';
 import 'package:downloader/presentation/widgets/manual_url_dialog.dart';
+import 'package:downloader/presentation/widgets/video_picker_tile.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 /// Single-screen in-app browser with best-effort video detection + download.
 ///
 /// Follows Clean Architecture: depends only on domain abstractions
-/// ([IVideoDetector], [DetectVideoUseCase], [DownloadVideoUseCase]) injected
-/// via the constructor.
+/// ([IVideoDetector], [DetectVideoUseCase], [DownloadVideoUseCase],
+/// [IReceiveShareGateway]) injected via the constructor.
 class BrowserPage extends StatefulWidget {
   const BrowserPage({
     super.key,
     required this.detector,
     required this.detectUseCase,
     required this.downloadUseCase,
+    required this.receiveShareGateway,
   });
 
   /// Abstraction for detecting video candidates from web events.
@@ -35,6 +38,9 @@ class BrowserPage extends StatefulWidget {
   /// Domain use case executing downloads and saving to storage.
   final DownloadVideoUseCase downloadUseCase;
 
+  /// Gateway that surfaces URLs shared into the app from external apps.
+  final IReceiveShareGateway receiveShareGateway;
+
   @override
   State<BrowserPage> createState() => _BrowserPageState();
 }
@@ -43,8 +49,15 @@ class _BrowserPageState extends State<BrowserPage> {
   InAppWebViewController? _webCtrl;
   final TextEditingController _urlCtrl =
       TextEditingController(text: 'https://www.google.com');
-  final List<DownloadRequest> _candidates = <DownloadRequest>[];
-  StreamSubscription<DownloadRequest>? _sub;
+
+  /// Detected video candidates keyed by URL for O(1) update on enrichment.
+  final Map<String, DownloadRequest> _candidateMap = {};
+
+  /// Ordered list for stable rendering in the bottom-sheet.
+  final List<String> _candidateOrder = [];
+
+  StreamSubscription<DownloadRequest>? _detectSub;
+  StreamSubscription<String>? _shareSub;
   double _pageProgress = 0;
   double _dlProgress = 0;
   bool _downloading = false;
@@ -57,26 +70,53 @@ class _BrowserPageState extends State<BrowserPage> {
   @override
   void initState() {
     super.initState();
-    _sub = widget.detectUseCase.videos.listen(_onVideoDetected);
+
+    // Subscribe to detected videos (initial emission + enrichment re-emissions).
+    _detectSub = widget.detectUseCase.videos.listen(_onVideoDetected);
+
+    // Subscribe to URLs shared from external apps (YouTube, browsers, etc.).
+    _shareSub =
+        widget.receiveShareGateway.incomingUrls.listen(_onSharedUrlReceived);
   }
 
   @override
   void dispose() {
-    _sub?.cancel();
-    _sub = null;
+    _detectSub?.cancel();
+    _detectSub = null;
+    _shareSub?.cancel();
+    _shareSub = null;
     _scanTimer?.cancel();
     _scanTimer = null;
     _urlCtrl.dispose();
     super.dispose();
   }
 
+  // ---------------------------------------------------------------------------
+  // Event handlers
+  // ---------------------------------------------------------------------------
+
   void _onVideoDetected(DownloadRequest req) {
     if (!mounted) return;
     setState(() {
-      // Deduplication is handled upstream by IVideoDetector
-      _candidates.add(req);
+      final bool isNew = !_candidateMap.containsKey(req.url);
+      _candidateMap[req.url] = req;
+      if (isNew) {
+        _candidateOrder.add(req.url);
+      }
+      // If not new, the map value is updated in-place so the bottom-sheet
+      // picks up the enriched data on next open/rebuild.
     });
   }
+
+  void _onSharedUrlReceived(String url) {
+    if (!mounted) return;
+    _urlCtrl.text = url;
+    _loadUrl(url);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Navigation helpers
+  // ---------------------------------------------------------------------------
 
   String _normalizeInput(String raw) {
     final String input = raw.trim();
@@ -93,7 +133,8 @@ class _BrowserPageState extends State<BrowserPage> {
     if (normalized.isEmpty) return;
     try {
       unawaited(
-        _webCtrl?.loadUrl(urlRequest: URLRequest(url: WebUri(normalized))),
+        _webCtrl?.loadUrl(urlRequest: URLRequest(url: WebUri(normalized)))
+            ?? Future<void>.value(),
       );
     } catch (_) {
       if (!mounted) return;
@@ -122,23 +163,45 @@ class _BrowserPageState extends State<BrowserPage> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // DOM scan — parses rich objects from videoScanJs
+  // ---------------------------------------------------------------------------
+
   Future<void> _runDomScan() async {
     final InAppWebViewController? ctrl = _webCtrl;
     final String? script = widget.detector.pageScanScript;
     if (ctrl == null || script == null) return;
     try {
       final dynamic result = await ctrl.evaluateJavascript(source: script);
-      final List<dynamic>? urls = _parseUrlList(result);
-      if (urls == null) return;
-      for (final dynamic item in urls) {
-        final String u = item.toString();
-        if (u.isEmpty || u == 'null') continue;
-        widget.detector.handleUrl(u, source: 'dom-scan');
+      final List<dynamic>? items = _parseJsonList(result);
+      if (items == null) return;
+
+      for (final dynamic item in items) {
+        // The new JS returns objects; the old plain-string format is still
+        // supported as a safe fallback.
+        if (item is Map<dynamic, dynamic> || item is Map<String, dynamic>) {
+          final Map<dynamic, dynamic> obj = item as Map<dynamic, dynamic>;
+          final String url = (obj['url'] ?? '').toString();
+          if (url.isEmpty || url == 'null') continue;
+          final String rawTitle = (obj['title'] ?? '').toString().trim();
+          final String rawQl = (obj['ql'] ?? '').toString().trim();
+          widget.detector.handleUrl(
+            url,
+            source: 'dom-scan',
+            title: rawTitle.isEmpty ? null : rawTitle,
+            qualityLabel: rawQl.isEmpty ? null : rawQl,
+          );
+        } else {
+          // Legacy fallback: plain URL string.
+          final String u = item.toString();
+          if (u.isEmpty || u == 'null') continue;
+          widget.detector.handleUrl(u, source: 'dom-scan');
+        }
       }
     } catch (_) {}
   }
 
-  List<dynamic>? _parseUrlList(dynamic result) {
+  List<dynamic>? _parseJsonList(dynamic result) {
     try {
       if (result == null) return null;
       if (result is List) return result;
@@ -152,6 +215,10 @@ class _BrowserPageState extends State<BrowserPage> {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Manual paste
+  // ---------------------------------------------------------------------------
+
   Future<void> _onManualPaste() async {
     final String? pasted = await ManualUrlDialog.show(
       context,
@@ -164,91 +231,92 @@ class _BrowserPageState extends State<BrowserPage> {
     widget.detector.addManualUrl(url);
   }
 
+  // ---------------------------------------------------------------------------
+  // Video picker bottom-sheet
+  // ---------------------------------------------------------------------------
+
   void _showCandidates() {
-    if (_candidates.isEmpty) return;
+    if (_candidateMap.isEmpty) return;
     unawaited(
       showModalBottomSheet<void>(
         context: context,
+        isScrollControlled: true,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
         builder: (BuildContext sheetContext) {
           return SafeArea(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-                  child: Row(
-                    children: <Widget>[
-                      Expanded(
-                        child: Text(
-                          'Videos found (${_candidates.length})',
-                          style: Theme.of(sheetContext).textTheme.titleSmall,
+            child: DraggableScrollableSheet(
+              initialChildSize: 0.5,
+              minChildSize: 0.3,
+              maxChildSize: 0.9,
+              expand: false,
+              builder:
+                  (BuildContext ctx, ScrollController scrollCtrl) {
+                // Take a snapshot of candidates at sheet-open time.
+                final List<DownloadRequest> candidates = _candidateOrder
+                    .map((url) => _candidateMap[url])
+                    .whereType<DownloadRequest>()
+                    .toList();
+
+                return Column(
+                  children: <Widget>[
+                    // Handle bar
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10, bottom: 4),
+                      child: Container(
+                        width: 36,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Theme.of(sheetContext)
+                              .colorScheme
+                              .outlineVariant,
+                          borderRadius: BorderRadius.circular(2),
                         ),
                       ),
-                      IconButton(
-                        icon: const Icon(Icons.close),
-                        onPressed: () =>
-                            Navigator.of(sheetContext).pop(),
-                      ),
-                    ],
-                  ),
-                ),
-                Flexible(
-                  child: ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: _candidates.length,
-                    itemBuilder: (context, index) {
-                      final DownloadRequest req = _candidates[index];
-                      final String ext =
-                          _extensionOf(req.suggestedFileName);
-                      return ListTile(
-                        title: Row(
-                          children: <Widget>[
-                            Expanded(
-                              child: Text(
-                                req.suggestedFileName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
+                    ),
+                    // Header row
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+                      child: Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: Text(
+                              'Videos found (${candidates.length})',
+                              style: Theme.of(sheetContext)
+                                  .textTheme
+                                  .titleSmall,
                             ),
-                            if (ext.isNotEmpty) ...<Widget>[
-                              const SizedBox(width: 8),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .primaryContainer,
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  ext.toUpperCase(),
-                                  style:
-                                      Theme.of(context).textTheme.labelSmall,
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                        subtitle: Text(
-                          req.url,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        trailing: TextButton(
-                          onPressed: () {
-                            Navigator.of(sheetContext).pop();
-                            unawaited(_startDownload(req));
-                          },
-                          child: const Text('Download'),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close),
+                            onPressed: () =>
+                                Navigator.of(sheetContext).pop(),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // Candidate list
+                    Expanded(
+                      child: ListView.builder(
+                        controller: scrollCtrl,
+                        padding: const EdgeInsets.only(bottom: 16),
+                        itemCount: candidates.length,
+                        itemBuilder: (BuildContext _, int index) {
+                          final DownloadRequest req = candidates[index];
+                          return VideoPickerTile(
+                            request: req,
+                            onDownload: () {
+                              Navigator.of(sheetContext).pop();
+                              unawaited(_startDownload(req));
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
           );
         },
@@ -256,11 +324,9 @@ class _BrowserPageState extends State<BrowserPage> {
     );
   }
 
-  String _extensionOf(String fileName) {
-    final int dot = fileName.lastIndexOf('.');
-    if (dot < 0 || dot == fileName.length - 1) return '';
-    return fileName.substring(dot + 1).toLowerCase();
-  }
+  // ---------------------------------------------------------------------------
+  // Download
+  // ---------------------------------------------------------------------------
 
   Future<void> _startDownload(DownloadRequest req) async {
     setState(() {
@@ -281,7 +347,8 @@ class _BrowserPageState extends State<BrowserPage> {
           if (gen != _dlGen || !mounted) return;
           setState(() {
             _downloading = false;
-            _candidates.removeWhere((c) => c.url == req.url);
+            _candidateMap.remove(req.url);
+            _candidateOrder.remove(req.url);
           });
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Saved: $saved')),
@@ -316,6 +383,10 @@ class _BrowserPageState extends State<BrowserPage> {
     setState(() => _downloading = false);
   }
 
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -324,9 +395,9 @@ class _BrowserPageState extends State<BrowserPage> {
           children: <Widget>[
             AddressBar(
               controller: _urlCtrl,
-              onBack: () => unawaited(_webCtrl?.goBack()),
-              onForward: () => unawaited(_webCtrl?.goForward()),
-              onReload: () => unawaited(_webCtrl?.reload()),
+              onBack: () => unawaited(_webCtrl?.goBack() ?? Future<void>.value()),
+              onForward: () => unawaited(_webCtrl?.goForward() ?? Future<void>.value()),
+              onReload: () => unawaited(_webCtrl?.reload() ?? Future<void>.value()),
               onSubmitted: _loadUrl,
               canGoBack: _canGoBack,
               canGoForward: _canGoForward,
@@ -403,12 +474,12 @@ class _BrowserPageState extends State<BrowserPage> {
                   try {
                     final String? currentUrl =
                         (await controller.getUrl())?.toString();
-                    // Only inject fetch hook and restart periodic scan for main page load
                     if (url != null && currentUrl == url.toString()) {
                       final String? hookScript =
                           widget.detector.networkHookScript;
                       if (hookScript != null) {
-                        await controller.evaluateJavascript(source: hookScript);
+                        await controller.evaluateJavascript(
+                            source: hookScript);
                       }
                       _restartScanTimer();
                     }
@@ -436,8 +507,8 @@ class _BrowserPageState extends State<BrowserPage> {
           ),
           const SizedBox(height: 12),
           AnimatedDownloadFab(
-            visible: _candidates.isNotEmpty && !_downloading,
-            count: _candidates.length,
+            visible: _candidateMap.isNotEmpty && !_downloading,
+            count: _candidateMap.length,
             onPressed: _showCandidates,
           ),
         ],
