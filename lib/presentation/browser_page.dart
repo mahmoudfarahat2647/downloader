@@ -185,11 +185,15 @@ class _BrowserPageState extends State<BrowserPage> {
           if (url.isEmpty || url == 'null') continue;
           final String rawTitle = (obj['title'] ?? '').toString().trim();
           final String rawQl = (obj['ql'] ?? '').toString().trim();
+          final String tSrc = (obj['tSrc'] ?? 'doc').toString();
+          final bool isGeneric =
+              tSrc != 'video-attr' && tSrc != 'anchor';
           widget.detector.handleUrl(
             url,
             source: 'dom-scan',
             title: rawTitle.isEmpty ? null : rawTitle,
             qualityLabel: rawQl.isEmpty ? null : rawQl,
+            isGenericTitle: isGeneric,
           );
         } else {
           // Legacy fallback: plain URL string.

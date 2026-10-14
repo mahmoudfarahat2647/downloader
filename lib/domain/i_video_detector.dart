@@ -16,6 +16,11 @@ abstract class IVideoDetector {
   /// supplied when the call site already has richer information (e.g. from
   /// a DOM scan). When the URL is already known, the implementation should
   /// *merge* the new metadata rather than silently dropping the call.
+  ///
+  /// [isGenericTitle] marks whether [title] is a generic fallback
+  /// (`document.title`) as opposed to a specific source (`<video title>`,
+  /// anchor text). Generic titles never overwrite specific ones, but
+  /// specific titles may upgrade a previously stored generic title.
   bool handleUrl(
     String url, {
     Map<String, String>? headers,
@@ -24,6 +29,7 @@ abstract class IVideoDetector {
     String? title,
     int? contentLength,
     String? qualityLabel,
+    bool isGenericTitle = false,
   });
 
   /// Submits a user-entered URL for validation/detection.

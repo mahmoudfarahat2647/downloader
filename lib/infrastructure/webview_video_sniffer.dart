@@ -30,6 +30,12 @@ class WebViewVideoSniffer implements IVideoDetector {
   /// Keyed by normalised URL → current best-known [DownloadRequest].
   final Map<String, DownloadRequest> _knownRequests = {};
 
+  /// Tracks whether the stored title for [key] came from a generic fallback
+  /// (`document.title`) vs a specific source (`<video title>`, anchor text).
+  /// Used to allow specific titles to upgrade generic ones without allowing
+  /// generic scans to downgrade specific titles (no flip-flop).
+  final Map<String, bool> _titleIsGeneric = {};
+
   @override
   Stream<DownloadRequest> get detectedVideos => _controller.stream;
 
@@ -49,6 +55,7 @@ class WebViewVideoSniffer implements IVideoDetector {
     String? title,
     int? contentLength,
     String? qualityLabel,
+    bool isGenericTitle = false,
   }) {
     final String trimmed = url.trim();
     if (trimmed.isEmpty) return false;
@@ -61,6 +68,11 @@ class WebViewVideoSniffer implements IVideoDetector {
     if (_controller.isClosed) return false;
 
     final DownloadRequest? existing = _knownRequests[key];
+    final String? newTitle = _nonEmpty(title);
+    // Fall back to URL-pattern inference so intercept/js/resource/manual
+    // paths that bypass the DOM scan still get a quality badge.
+    final String? effectiveQuality =
+        _nonEmpty(qualityLabel) ?? qualityLabelFromUrl(trimmed);
 
     if (existing == null) {
       // ── New URL ────────────────────────────────────────────────────────────
@@ -69,11 +81,12 @@ class WebViewVideoSniffer implements IVideoDetector {
         suggestedFileName: VideoUrlMatcher.suggestFileName(trimmed),
         detectedAt: DateTime.now(),
         headers: headers,
-        title: _nonEmpty(title),
+        title: newTitle,
         contentLength: contentLength,
-        qualityLabel: _nonEmpty(qualityLabel),
+        qualityLabel: effectiveQuality,
       );
       _knownRequests[key] = req;
+      _titleIsGeneric[key] = newTitle == null || isGenericTitle;
       _controller.add(req);
 
       // Fire a background HEAD request to fill in contentLength if missing.
@@ -84,23 +97,32 @@ class WebViewVideoSniffer implements IVideoDetector {
     }
 
     // ── Known URL — attempt metadata enrichment ────────────────────────────
-    final bool hasNewTitle =
-        _nonEmpty(title) != null && existing.title == null;
+    // Titles: null → anything is an upgrade; generic → specific is an
+    // upgrade; same-rank differing values keep the first (no flip-flop).
+    final bool existingGeneric = _titleIsGeneric[key] ?? true;
+    final bool hasNewTitle = newTitle != null &&
+        (existing.title == null ||
+            (existingGeneric &&
+                !isGenericTitle &&
+                newTitle != existing.title));
     final bool hasNewLength =
         contentLength != null && existing.contentLength == null;
     final bool hasNewQuality =
-        _nonEmpty(qualityLabel) != null && existing.qualityLabel == null;
+        effectiveQuality != null && existing.qualityLabel == null;
 
     if (!hasNewTitle && !hasNewLength && !hasNewQuality) {
       return false; // Nothing new to add.
     }
 
     final DownloadRequest enriched = existing.copyWith(
-      title: hasNewTitle ? _nonEmpty(title) : null,
+      title: hasNewTitle ? newTitle : null,
       contentLength: hasNewLength ? contentLength : null,
-      qualityLabel: hasNewQuality ? _nonEmpty(qualityLabel) : null,
+      qualityLabel: hasNewQuality ? effectiveQuality : null,
     );
     _knownRequests[key] = enriched;
+    if (hasNewTitle) {
+      _titleIsGeneric[key] = isGenericTitle;
+    }
     _controller.add(enriched);
     return true;
   }
@@ -195,18 +217,11 @@ class WebViewVideoSniffer implements IVideoDetector {
     return t.isEmpty ? null : t;
   }
 
-  /// Maps a pixel height to a standard quality label.
-  static String? qualityLabelFromHeight(int height) {
-    if (height <= 0) return null;
-    if (height >= 1080) return '1080p';
-    if (height >= 720) return '720p';
-    if (height >= 480) return '480p';
-    if (height >= 360) return '360p';
-    if (height >= 240) return '240p';
-    return '${height}p';
-  }
-
   /// Extracts a quality label from URL patterns like "720p", "1080", etc.
+  ///
+  /// Intentional mirror of `qlFromUrl()` in [videoScanJs] below — kept in
+  /// both runtimes: JS resolves in-WebView synchronously per DOM node, Dart
+  /// is the fallback for intercept/resource/manual URLs that bypass JS.
   static String? qualityLabelFromUrl(String url) {
     final RegExpMatch? m =
         RegExp(r'(2160|1440|1080|720|480|360|240)p?', caseSensitive: false)
@@ -231,8 +246,11 @@ var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u)
 ''';
 
   /// Enhanced DOM scan that returns an array of rich objects:
-  /// `{ url, title, ql }` where `ql` is the quality label resolved in
-  /// priority order: `<source label/res>` attribute → URL pattern → videoHeight.
+  /// `{ url, title, ql, tSrc }` where `ql` is the quality label resolved in
+  /// priority order: `<source label/res>` attribute → URL pattern → videoHeight,
+  /// and `tSrc` marks title provenance (`video-attr`/`anchor` = specific,
+  /// `doc` = generic `document.title` fallback) so Dart can upgrade generic
+  /// titles without downgrading specific ones.
   ///
   /// Returns a JSON array string.
   static const String videoScanJs = r'''
@@ -258,7 +276,10 @@ var vs=document.querySelectorAll('video');
 for(var i=0;i<vs.length;i++){
   var v=vs[i];
   var urls=[v.currentSrc,v.src].filter(function(u){return typeof u==='string'&&u;});
-  var ptitle=v.getAttribute('title')||document.title||'';
+  var vAttr=(v.getAttribute('title')||'').trim();
+  var vHasSpecific=vAttr!=='';
+  var ptitle=vHasSpecific?vAttr:(document.title||'');
+  var pSrc=vHasSpecific?'video-attr':'doc';
   // Try quality from child <source> matching currentSrc first
   var ql='';
   var childSrcs=v.querySelectorAll('source');
@@ -271,7 +292,7 @@ for(var i=0;i<vs.length;i++){
     var finalQl=ql||qlFromUrl(urls[u]);
     // videoHeight fallback (often 0 before play, but worth trying)
     if(!finalQl&&v.videoHeight>0)finalQl=v.videoHeight+'p';
-    push({url:urls[u],title:ptitle,ql:finalQl});
+    push({url:urls[u],title:ptitle,ql:finalQl,tSrc:pSrc});
   }
 }
 // --- standalone <source> tags ---
@@ -280,14 +301,15 @@ for(var j=0;j<ss.length;j++){
   var src=ss[j].src||'';
   if(!src)continue;
   var q=qlFromSource(ss[j])||qlFromUrl(src);
-  push({url:src,title:document.title||'',ql:q});
+  push({url:src,title:document.title||'',ql:q,tSrc:'doc'});
 }
 // --- direct video anchors ---
 var as=document.querySelectorAll('a[href]');
 for(var k=0;k<as.length;k++){
   var h=as[k].href||'';
   if(/\.(mp4|webm)(\?|#|$)/i.test(h)){
-    push({url:h,title:as[k].textContent.trim()||document.title||'',ql:qlFromUrl(h)});
+    var aText=(as[k].textContent||'').trim();
+    push({url:h,title:aText||document.title||'',ql:qlFromUrl(h),tSrc:aText?'anchor':'doc'});
   }
 }
 return JSON.stringify(out);

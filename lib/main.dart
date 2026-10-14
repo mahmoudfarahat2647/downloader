@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:downloader/domain/detect_video_use_case.dart';
 import 'package:downloader/domain/download_video_use_case.dart';
 import 'package:downloader/domain/i_receive_share_gateway.dart';
+import 'package:downloader/domain/i_video_detector.dart';
 import 'package:downloader/infrastructure/dio_download_service.dart';
 import 'package:downloader/infrastructure/media_store_gateway.dart';
 import 'package:downloader/infrastructure/receive_share_gateway.dart';
@@ -38,7 +39,7 @@ class VideoDownloaderApp extends StatefulWidget {
     required this.receiveShareGateway,
   });
 
-  final WebViewVideoSniffer detector;
+  final IVideoDetector detector;
   final DetectVideoUseCase detectUseCase;
   final DownloadVideoUseCase downloadUseCase;
   final IReceiveShareGateway receiveShareGateway;

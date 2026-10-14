@@ -12,7 +12,9 @@ import 'package:downloader/domain/i_receive_share_gateway.dart';
 ///  - **Hot resume**: app was already running when the intent arrived.
 ///
 /// Filters out non-URL payloads; only `http://` and `https://` strings are
-/// forwarded on [incomingUrls].
+/// forwarded on [incomingUrls]. URLs may be embedded in surrounding share
+/// text (e.g. `"Video Title https://..."` from YouTube/X/TikTok), so the
+/// first HTTP(S) URL is extracted from anywhere within the payload.
 class ReceiveShareGateway implements IReceiveShareGateway {
   ReceiveShareGateway() {
     // Hot-resume: intent arrives while app is already in foreground/background.
@@ -31,16 +33,36 @@ class ReceiveShareGateway implements IReceiveShareGateway {
 
   StreamSubscription<List<SharedMediaFile>>? _liveSub;
 
+  static final RegExp _urlRe = RegExp(r'https?://\S+');
+
+  /// Extracts the first HTTP(S) URL from [text], or returns null when none
+  /// is present. Surrounding share text and trailing prose punctuation
+  /// (`.,;:!?)]}>'"`) are stripped so `"Title https://x/y."` yields a
+  /// loadable URL.
+  static String? extractFirstUrl(String text) {
+    final RegExpMatch? m = _urlRe.firstMatch(text);
+    if (m == null) return null;
+    return _stripTrailingPunct(m.group(0)!);
+  }
+
+  static String _stripTrailingPunct(String url) {
+    var end = url.length;
+    while (end > 0 && '.,;:!?)]}>\'"'.contains(url[end - 1])) {
+      end--;
+    }
+    return url.substring(0, end);
+  }
+
   @override
   Stream<String> get incomingUrls => _ctrl.stream;
 
   void _handleFiles(List<SharedMediaFile> files) {
     for (final SharedMediaFile file in files) {
       final String candidate = file.path.trim();
-      if (candidate.startsWith('http://') ||
-          candidate.startsWith('https://')) {
+      final String? url = extractFirstUrl(candidate);
+      if (url != null && url.isNotEmpty) {
         if (!_ctrl.isClosed) {
-          _ctrl.add(candidate);
+          _ctrl.add(url);
         }
       }
     }
