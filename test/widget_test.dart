@@ -124,8 +124,8 @@ void main() {
       expect(sniffer.handleUrl('https://example.com/video.mp4'), isTrue);
       // Rejects duplicate
       expect(sniffer.handleUrl('https://example.com/video.mp4'), isFalse);
-      // Rejects blob
-      expect(sniffer.handleUrl('blob:https://example.com/uuid'), isFalse);
+      // Blob kept as needsResolve placeholder by sniffer (filtered by useCase)
+      expect(sniffer.handleUrl('blob:https://example.com/uuid'), isTrue);
       // Sniffer accepts non-video url candidate, but useCase filters it out
       expect(sniffer.handleUrl('https://example.com/ad/tracking.js'), isTrue);
 
@@ -133,6 +133,63 @@ void main() {
 
       expect(detected.length, 1);
       expect(detected.first.url, 'https://example.com/video.mp4');
+
+      await subscription.cancel();
+      sniffer.dispose();
+    });
+
+    test('blob kept by sniffer but filtered out by use case', () async {
+      final WebViewVideoSniffer sniffer = WebViewVideoSniffer();
+      final DetectVideoUseCase useCase = DetectVideoUseCase(sniffer);
+
+      final List<DownloadRequest> detected = <DownloadRequest>[];
+      final subscription = useCase.videos.listen(detected.add);
+
+      expect(sniffer.handleUrl('blob:https://example.com/uuid'), isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(detected, isEmpty);
+
+      await subscription.cancel();
+      sniffer.dispose();
+    });
+
+    test('extensionless URL with video content-type passes filter', () async {
+      final WebViewVideoSniffer sniffer = WebViewVideoSniffer();
+      final DetectVideoUseCase useCase = DetectVideoUseCase(sniffer);
+
+      final List<DownloadRequest> detected = <DownloadRequest>[];
+      final subscription = useCase.videos.listen(detected.add);
+
+      expect(
+          sniffer.handleUrl('https://fbcdn.example.com/v/12345',
+              contentType: 'video/mp4'),
+          isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(detected.length, 1);
+      expect(detected.first.url, 'https://fbcdn.example.com/v/12345');
+
+      await subscription.cancel();
+      sniffer.dispose();
+    });
+
+    test('.m3u8 URL passes filter', () async {
+      final WebViewVideoSniffer sniffer = WebViewVideoSniffer();
+      final DetectVideoUseCase useCase = DetectVideoUseCase(sniffer);
+
+      final List<DownloadRequest> detected = <DownloadRequest>[];
+      final subscription = useCase.videos.listen(detected.add);
+
+      expect(sniffer.handleUrl('https://example.com/stream/playlist.m3u8'),
+          isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(detected.length, 1);
+      expect(detected.first.url, 'https://example.com/stream/playlist.m3u8');
 
       await subscription.cancel();
       sniffer.dispose();

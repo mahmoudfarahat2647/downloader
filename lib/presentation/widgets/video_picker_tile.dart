@@ -13,10 +13,24 @@ class VideoPickerTile extends StatelessWidget {
     super.key,
     required this.request,
     required this.onDownload,
+    this.enabled = true,
+    this.subtitleOverride,
   });
 
   final DownloadRequest request;
   final VoidCallback onDownload;
+
+  /// Whether the tile offers a download action.
+  ///
+  /// Defaults to true to keep existing call sites compiling. When false,
+  /// the tile is greyed out, the tap target is disabled, and the trailing
+  /// action shows a waiting indicator instead of the download button.
+  final bool enabled;
+
+  /// Optional subtitle override (e.g. `'Resolving stream…'`).
+  ///
+  /// Defaults to null, which falls back to displaying [DownloadRequest.url].
+  final String? subtitleOverride;
 
   @override
   Widget build(BuildContext context) {
@@ -32,7 +46,9 @@ class VideoPickerTile extends StatelessWidget {
     final String? qualityLabel = request.qualityLabel;
     final String? formatLabel = _formatBadge(request.suggestedFileName);
 
-    return Padding(
+    final String subtitle = subtitleOverride ?? request.url;
+
+    final Widget card = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       child: Card(
         elevation: 0,
@@ -63,7 +79,7 @@ class VideoPickerTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      request.url,
+                      subtitle,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: texts.bodySmall
@@ -104,28 +120,46 @@ class VideoPickerTile extends StatelessWidget {
                   ],
                 ),
               ),
-              // Download button
-              TextButton(
-                onPressed: onDownload,
-                style: TextButton.styleFrom(
-                  foregroundColor: colors.primary,
+              // Download button (or waiting indicator when disabled).
+              if (enabled)
+                TextButton(
+                  onPressed: onDownload,
+                  style: TextButton.styleFrom(
+                    foregroundColor: colors.primary,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 10, vertical: 6),
+                  ),
+                  child: const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Icon(Icons.download_rounded, size: 20),
+                      SizedBox(height: 2),
+                      Text('Save', style: TextStyle(fontSize: 11)),
+                    ],
+                  ),
+                )
+              else
+                const Padding(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Icon(Icons.hourglass_top_rounded, size: 20),
+                      SizedBox(height: 2),
+                      Text('Wait', style: TextStyle(fontSize: 11)),
+                    ],
+                  ),
                 ),
-                child: const Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Icon(Icons.download_rounded, size: 20),
-                    SizedBox(height: 2),
-                    Text('Save', style: TextStyle(fontSize: 11)),
-                  ],
-                ),
-              ),
             ],
           ),
         ),
       ),
     );
+    if (!enabled) {
+      return Opacity(opacity: 0.6, child: card);
+    }
+    return card;
   }
 
   // ---------------------------------------------------------------------------

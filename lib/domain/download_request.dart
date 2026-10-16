@@ -1,3 +1,28 @@
+/// Classifies the kind of video resource behind a [DownloadRequest].
+///
+/// Determined at detection time from the URL extension and/or the HTTP
+/// `content-type` header ([VideoKind.hls] for `.m3u8`,
+/// [VideoKind.dash] for `.mpd`, [VideoKind.blob] for opaque `blob:`
+/// object URLs, [VideoKind.direct] for progressive files, and
+/// [VideoKind.unknown] when nothing conclusive was observed).
+enum VideoKind {
+  /// Direct progressive file (`.mp4`/`.webm`/`.mov`/`.m4v` or `video/*`).
+  direct,
+
+  /// HLS playlist (`.m3u8` or `application/x-mpegURL`).
+  hls,
+
+  /// DASH manifest (`.mpd` or `application/dash+xml`).
+  dash,
+
+  /// Opaque `blob:` object URL — not directly downloadable, waiting for
+  /// the real URL to be resolved from the page/network layer.
+  blob,
+
+  /// Accepted candidate whose kind could not be determined yet.
+  unknown,
+}
+
 /// Value object describing a single detected downloadable video.
 ///
 /// The [url] is the original unmodified URL as observed (e.g. from a
@@ -43,6 +68,24 @@ class DownloadRequest {
   /// Null when none of the above yields a result.
   final String? qualityLabel;
 
+  /// Kind of video resource (direct file, HLS, DASH, blob, unknown).
+  ///
+  /// Null only for requests constructed before the kind contract existed;
+  /// new detections always set it. Consumers should treat null as unknown.
+  final VideoKind? kind;
+
+  /// MIME type observed for [url] (e.g. from a HEAD response header).
+  ///
+  /// Stored as received (may include parameters such as `; charset=...`).
+  /// Null when not observed.
+  final String? contentType;
+
+  /// Whether [url] still needs resolving before it can be downloaded.
+  ///
+  /// True for opaque `blob:` object URLs, which are kept as placeholders
+  /// waiting for the real URL — no base64 blob bridge is attempted.
+  final bool needsResolve;
+
   /// Creates a new [DownloadRequest].
   const DownloadRequest({
     required this.url,
@@ -52,6 +95,9 @@ class DownloadRequest {
     this.title,
     this.contentLength,
     this.qualityLabel,
+    this.kind,
+    this.contentType,
+    this.needsResolve = false,
   });
 
   /// Creates a copy with the given fields replaced.
@@ -63,6 +109,9 @@ class DownloadRequest {
     String? title,
     int? contentLength,
     String? qualityLabel,
+    VideoKind? kind,
+    String? contentType,
+    bool? needsResolve,
   }) {
     return DownloadRequest(
       url: url ?? this.url,
@@ -72,6 +121,9 @@ class DownloadRequest {
       title: title ?? this.title,
       contentLength: contentLength ?? this.contentLength,
       qualityLabel: qualityLabel ?? this.qualityLabel,
+      kind: kind ?? this.kind,
+      contentType: contentType ?? this.contentType,
+      needsResolve: needsResolve ?? this.needsResolve,
     );
   }
 
@@ -85,6 +137,9 @@ class DownloadRequest {
         other.title == title &&
         other.contentLength == contentLength &&
         other.qualityLabel == qualityLabel &&
+        other.kind == kind &&
+        other.contentType == contentType &&
+        other.needsResolve == needsResolve &&
         _mapsEqual(other.headers, headers);
   }
 
@@ -96,6 +151,9 @@ class DownloadRequest {
         title,
         contentLength,
         qualityLabel,
+        kind,
+        contentType,
+        needsResolve,
         _mapHash(headers),
       );
 
@@ -104,7 +162,8 @@ class DownloadRequest {
       'DownloadRequest(url: $url, suggestedFileName: $suggestedFileName, '
       'detectedAt: $detectedAt, title: $title, '
       'contentLength: $contentLength, qualityLabel: $qualityLabel, '
-      'headers: $headers)';
+      'kind: $kind, contentType: $contentType, '
+      'needsResolve: $needsResolve, headers: $headers)';
 }
 
 /// Compares two nullable string maps for equality.

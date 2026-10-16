@@ -15,6 +15,15 @@ class DetectVideoUseCase {
   const DetectVideoUseCase(this.detector);
 
   /// Stream of validated [DownloadRequest]s safe to offer for download.
+  ///
+  /// Filters each event through [VideoUrlMatcher.looksDownloadable] using
+  /// the request's observed [DownloadRequest.contentType] (so extensionless
+  /// delivery URLs with a video content-type still pass), and hides
+  /// unresolvable placeholders ([DownloadRequest.needsResolve] or
+  /// [VideoKind.blob]) until the real URL is resolved.
   Stream<DownloadRequest> get videos =>
-      detector.detectedVideos.where((DownloadRequest r) => VideoUrlMatcher.looksDownloadable(r.url));
+      detector.detectedVideos.where((DownloadRequest r) =>
+          VideoUrlMatcher.looksDownloadable(r.url, r.contentType) &&
+          !r.needsResolve &&
+          r.kind != VideoKind.blob);
 }

@@ -5,8 +5,10 @@ import 'package:downloader/domain/download_video_use_case.dart';
 import 'package:downloader/domain/i_receive_share_gateway.dart';
 import 'package:downloader/domain/i_video_detector.dart';
 import 'package:downloader/infrastructure/dio_download_service.dart';
+import 'package:downloader/infrastructure/hls_download_service.dart';
 import 'package:downloader/infrastructure/media_store_gateway.dart';
 import 'package:downloader/infrastructure/receive_share_gateway.dart';
+import 'package:downloader/infrastructure/webview_cookie_bridge.dart';
 import 'package:downloader/infrastructure/webview_video_sniffer.dart';
 import 'package:downloader/presentation/browser_page.dart';
 
@@ -19,6 +21,8 @@ void main() {
   final DownloadVideoUseCase downloadUseCase = DownloadVideoUseCase(
     DioDownloadService(),
     MediaStoreGateway(),
+    hlsDownloader: HlsDownloadService(),
+    headerBuilder: WebViewCookieBridge.buildHeaders,
   );
   final ReceiveShareGateway receiveShareGateway = ReceiveShareGateway();
 

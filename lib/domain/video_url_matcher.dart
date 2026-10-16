@@ -33,14 +33,19 @@ class VideoUrlMatcher {
     }
   }
 
-  /// Returns true for `video/mp4` and `video/webm` content types.
+  /// Returns true for `video/mp4`, `video/webm`, `application/x-mpegURL`
+  /// and `application/dash+xml` content types.
   ///
   /// Strips parameters after `;`, trims whitespace and lowercases before
-  /// comparing. Null input returns false.
+  /// comparing. Null input returns false. `text/html` and any other type
+  /// return false.
   static bool isVideoContentType(String? contentType) {
     if (contentType == null) return false;
     final String mime = contentType.split(';').first.trim().toLowerCase();
-    return mime == 'video/mp4' || mime == 'video/webm';
+    return mime == 'video/mp4' ||
+        mime == 'video/webm' ||
+        mime == 'application/x-mpegurl' ||
+        mime == 'application/dash+xml';
   }
 
   /// Normalizes [url] for de-duplication.
@@ -129,8 +134,126 @@ class VideoUrlMatcher {
   }
 
   /// Returns true when [url] looks like a real downloadable video:
-  /// [isVideoUrl] passes and [isLikelyFalsePositive] rejects it.
-  static bool looksDownloadable(String url) {
-    return isVideoUrl(url) && !isLikelyFalsePositive(url);
+  /// [isSupportedMediaUrl] passes and [isLikelyFalsePositive] rejects it.
+  ///
+  /// When [contentType] is supplied, an extensionless URL (e.g. an fbcdn
+  /// delivery link) still counts as supported if [isVideoContentType]
+  /// accepts the content type.
+  static bool looksDownloadable(String url, [String? contentType]) {
+    return isSupportedMediaUrl(url, contentType) &&
+        !isLikelyFalsePositive(url);
+  }
+
+  /// Returns true only for `.m3u8` (HLS) URLs.
+  ///
+  /// Rules mirror [isVideoUrl]: trims input; rejects empty strings; parses
+  /// with [Uri.parse]; rejects `blob:`, `data:`, `javascript:`, `about:`
+  /// and `file` schemes; inspects [Uri.path] only (before query/fragment),
+  /// lowercasing only the path for the extension check. Returns false on
+  /// parse errors.
+  static bool isHlsUrl(String url) {
+    try {
+      final String trimmed = url.trim();
+      if (trimmed.isEmpty) return false;
+      final Uri uri = Uri.parse(trimmed);
+      final String scheme = uri.scheme.toLowerCase();
+      if (scheme == 'blob' ||
+          scheme == 'data' ||
+          scheme == 'javascript' ||
+          scheme == 'about' ||
+          scheme == 'file') {
+        return false;
+      }
+      final String path = uri.path.toLowerCase();
+      return path.endsWith('.m3u8');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Returns true only for `.mpd` (DASH) URLs.
+  ///
+  /// Rules mirror [isVideoUrl]: trims input; rejects empty strings; parses
+  /// with [Uri.parse]; rejects `blob:`, `data:`, `javascript:`, `about:`
+  /// and `file` schemes; inspects [Uri.path] only (before query/fragment),
+  /// lowercasing only the path for the extension check. Returns false on
+  /// parse errors.
+  static bool isDashUrl(String url) {
+    try {
+      final String trimmed = url.trim();
+      if (trimmed.isEmpty) return false;
+      final Uri uri = Uri.parse(trimmed);
+      final String scheme = uri.scheme.toLowerCase();
+      if (scheme == 'blob' ||
+          scheme == 'data' ||
+          scheme == 'javascript' ||
+          scheme == 'about' ||
+          scheme == 'file') {
+        return false;
+      }
+      final String path = uri.path.toLowerCase();
+      return path.endsWith('.mpd');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Returns true for any supported media URL.
+  ///
+  /// Accepts `.mp4`, `.webm`, `.mov`, `.m4v`, `.m3u8` and `.mpd` by path
+  /// (same scheme/path rules as [isVideoUrl]), or — for extensionless
+  /// delivery URLs — when the optional [contentType] is accepted by
+  /// [isVideoContentType] (`video/mp4`, `video/webm`,
+  /// `application/x-mpegURL`, `application/dash+xml`).
+  static bool isSupportedMediaUrl(String url, [String? contentType]) {
+    if (isVideoUrl(url) || isHlsUrl(url) || isDashUrl(url)) return true;
+    try {
+      final String trimmed = url.trim();
+      if (trimmed.isEmpty) {
+        return contentType != null && isVideoContentType(contentType);
+      }
+      final Uri uri = Uri.parse(trimmed);
+      final String scheme = uri.scheme.toLowerCase();
+      if (scheme == 'blob' ||
+          scheme == 'data' ||
+          scheme == 'javascript' ||
+          scheme == 'about' ||
+          scheme == 'file') {
+        return false;
+      }
+      final String path = uri.path.toLowerCase();
+      if (path.endsWith('.mp4') ||
+          path.endsWith('.webm') ||
+          path.endsWith('.mov') ||
+          path.endsWith('.m4v') ||
+          path.endsWith('.m3u8') ||
+          path.endsWith('.mpd')) {
+        return true;
+      }
+    } catch (_) {
+      return false;
+    }
+    if (contentType == null) return false;
+    return isVideoContentType(contentType);
+  }
+
+  /// Returns true for any `http`/`https` URL.
+  ///
+  /// Trims input; requires a parseable [Uri] with scheme `http` or `https`
+  /// (case-insensitive) and a non-empty host. Used to decide whether a
+  /// pasted/shared link is a browsable page (including share links such as
+  /// `https://www.facebook.com/share/xyz`), as opposed to a direct media
+  /// file URL. Returns false on parse errors.
+  static bool isPageUrl(String url) {
+    try {
+      final String trimmed = url.trim();
+      if (trimmed.isEmpty) return false;
+      final Uri uri = Uri.parse(trimmed);
+      final String scheme = uri.scheme.toLowerCase();
+      if (scheme != 'http' && scheme != 'https') return false;
+      return uri.host.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
   }
 }

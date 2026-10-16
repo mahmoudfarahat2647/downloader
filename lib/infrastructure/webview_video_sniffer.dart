@@ -46,6 +46,19 @@ class WebViewVideoSniffer implements IVideoDetector {
   /// Evaluates [url] and emits (or enriches) a [DownloadRequest].
   ///
   /// Returns `true` when a request was emitted or updated.
+  ///
+  /// The [contentType] (e.g. from an interception header or HEAD response)
+  /// is honoured: a URL without a video extension is still classified when
+  /// [VideoUrlMatcher.isVideoContentType] accepts it. `blob:` URLs are kept
+  /// as [VideoKind.blob] placeholders with `needsResolve: true` — waiting
+  /// for the real URL — instead of being dropped. `data:` URLs stay
+  /// rejected. No base64 blob bridge is attempted.
+  ///
+  /// Deduplication keys on [VideoUrlMatcher.normalizeForDedup], which
+  /// preserves query parameters exactly. Limitation: the same video served
+  /// with rotated signature/query tokens therefore dedups as distinct
+  /// entries; aggressive token-stripping is deliberately avoided because it
+  /// could collide genuinely distinct videos.
   @override
   bool handleUrl(
     String url, {
@@ -61,11 +74,17 @@ class WebViewVideoSniffer implements IVideoDetector {
     if (trimmed.isEmpty) return false;
 
     final String lower = trimmed.toLowerCase();
-    if (lower.startsWith('blob:') || lower.startsWith('data:')) return false;
+    // `data:` stays rejected. `blob:` is kept as a needsResolve placeholder.
+    if (lower.startsWith('data:')) return false;
 
     final String key = VideoUrlMatcher.normalizeForDedup(trimmed);
 
     if (_controller.isClosed) return false;
+
+    final bool isBlob = lower.startsWith('blob:');
+    final VideoKind inferredKind = _inferKind(trimmed, contentType, isBlob);
+    final bool inferredNeedsResolve = isBlob;
+    final String? nonEmptyContentType = _nonEmpty(contentType);
 
     final DownloadRequest? existing = _knownRequests[key];
     final String? newTitle = _nonEmpty(title);
@@ -84,13 +103,17 @@ class WebViewVideoSniffer implements IVideoDetector {
         title: newTitle,
         contentLength: contentLength,
         qualityLabel: effectiveQuality,
+        kind: inferredKind,
+        contentType: nonEmptyContentType,
+        needsResolve: inferredNeedsResolve,
       );
       _knownRequests[key] = req;
       _titleIsGeneric[key] = newTitle == null || isGenericTitle;
       _controller.add(req);
 
       // Fire a background HEAD request to fill in contentLength if missing.
-      if (req.contentLength == null) {
+      // Skipped for blob: placeholders (not fetchable over HTTP).
+      if (req.contentLength == null && !isBlob) {
         _fetchMetadataInBackground(key, trimmed, headers);
       }
       return true;
@@ -109,8 +132,23 @@ class WebViewVideoSniffer implements IVideoDetector {
         contentLength != null && existing.contentLength == null;
     final bool hasNewQuality =
         effectiveQuality != null && existing.qualityLabel == null;
+    // Kind: null/unknown → anything concrete is an upgrade; concrete kinds
+    // never flip (first wins).
+    final bool hasNewKind = (existing.kind == null ||
+            existing.kind == VideoKind.unknown) &&
+        inferredKind != VideoKind.unknown &&
+        inferredKind != existing.kind;
+    final bool hasNewContentType =
+        nonEmptyContentType != null && existing.contentType == null;
+    // A placeholder that later resolves to a fetchable URL clears the flag.
+    final bool hasResolveUpdate = existing.needsResolve && !inferredNeedsResolve;
 
-    if (!hasNewTitle && !hasNewLength && !hasNewQuality) {
+    if (!hasNewTitle &&
+        !hasNewLength &&
+        !hasNewQuality &&
+        !hasNewKind &&
+        !hasNewContentType &&
+        !hasResolveUpdate) {
       return false; // Nothing new to add.
     }
 
@@ -118,6 +156,9 @@ class WebViewVideoSniffer implements IVideoDetector {
       title: hasNewTitle ? newTitle : null,
       contentLength: hasNewLength ? contentLength : null,
       qualityLabel: hasNewQuality ? effectiveQuality : null,
+      kind: hasNewKind ? inferredKind : null,
+      contentType: hasNewContentType ? nonEmptyContentType : null,
+      needsResolve: hasResolveUpdate ? inferredNeedsResolve : null,
     );
     _knownRequests[key] = enriched;
     if (hasNewTitle) {
@@ -127,13 +168,50 @@ class WebViewVideoSniffer implements IVideoDetector {
     return true;
   }
 
+  /// Infers the [VideoKind] from the URL extension and [contentType].
+  ///
+  /// `.m3u8` / `application/x-mpegURL` → [VideoKind.hls]; `.mpd` /
+  /// `application/dash+xml` → [VideoKind.dash]; `blob:` → [VideoKind.blob];
+  /// known progressive extensions or `video/*` → [VideoKind.direct];
+  /// anything else → [VideoKind.unknown].
+  static VideoKind _inferKind(
+      String url, String? contentType, bool isBlob) {
+    if (isBlob) return VideoKind.blob;
+    final String lower = url.toLowerCase();
+    String path = lower;
+    try {
+      path = Uri.parse(url.trim()).path.toLowerCase();
+    } catch (_) {
+      // Fall back to the raw lowercased URL.
+    }
+    if (path.endsWith('.m3u8')) return VideoKind.hls;
+    if (path.endsWith('.mpd')) return VideoKind.dash;
+    if (path.endsWith('.mp4') ||
+        path.endsWith('.webm') ||
+        path.endsWith('.mov') ||
+        path.endsWith('.m4v')) {
+      return VideoKind.direct;
+    }
+    if (contentType != null) {
+      final String mime =
+          contentType.split(';').first.trim().toLowerCase();
+      if (mime == 'application/x-mpegurl') return VideoKind.hls;
+      if (mime == 'application/dash+xml') return VideoKind.dash;
+      if (VideoUrlMatcher.isVideoContentType(contentType)) {
+        return VideoKind.direct;
+      }
+    }
+    return VideoKind.unknown;
+  }
+
   // ---------------------------------------------------------------------------
   // Background HEAD fetch
   // ---------------------------------------------------------------------------
 
-  /// Fires a lightweight HEAD request to obtain `content-length` from the
-  /// server. On success, calls [handleUrl] with just the [contentLength] to
-  /// trigger a merge. Failures are silently swallowed — this is best-effort.
+  /// Fires a lightweight HEAD request to obtain `content-length` (and
+  /// `content-type`) from the server. On success, re-enters [handleUrl] with
+  /// the observed values to trigger a merge. Failures are silently
+  /// swallowed — this is best-effort.
   void _fetchMetadataInBackground(
     String key,
     String url,
@@ -161,9 +239,20 @@ class WebViewVideoSniffer implements IVideoDetector {
       final String? rawLength =
           response.headers.value(Headers.contentLengthHeader);
       final int? length = rawLength != null ? int.tryParse(rawLength) : null;
-      if (length != null && length > 0 && !_controller.isClosed) {
-        // Re-enter handleUrl to trigger the merge path.
-        handleUrl(url, contentLength: length, source: 'head');
+      final String? responseType =
+          response.headers.value(Headers.contentTypeHeader);
+      final bool hasLength = length != null && length > 0;
+      final String? nonEmptyType = _nonEmpty(responseType);
+      if (!hasLength && nonEmptyType == null) return;
+      if (!_controller.isClosed) {
+        // Re-enter handleUrl to trigger the merge path (length and/or
+        // content-type → kind upgrade for extensionless delivery URLs).
+        handleUrl(
+          url,
+          contentLength: hasLength ? length : null,
+          contentType: nonEmptyType,
+          source: 'head',
+        );
       }
     } catch (_) {
       // Best-effort — network errors are acceptable.
@@ -246,11 +335,21 @@ var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u)
 ''';
 
   /// Enhanced DOM scan that returns an array of rich objects:
-  /// `{ url, title, ql, tSrc }` where `ql` is the quality label resolved in
-  /// priority order: `<source label/res>` attribute → URL pattern → videoHeight,
-  /// and `tSrc` marks title provenance (`video-attr`/`anchor` = specific,
-  /// `doc` = generic `document.title` fallback) so Dart can upgrade generic
-  /// titles without downgrading specific ones.
+  /// `{ url, title, ql, tSrc, kind }` where `ql` is the quality label
+  /// resolved in priority order: `<source label/res>` attribute → URL
+  /// pattern → videoHeight, `tSrc` marks title provenance
+  /// (`video-attr`/`anchor` = specific, `doc` = generic `document.title`
+  /// fallback) so Dart can upgrade generic titles without downgrading
+  /// specific ones, and `kind` mirrors Dart [_inferKind]
+  /// (`hls`/`dash`/`blob`/`direct`/`unknown`).
+  ///
+  /// `currentSrc` is reported even when it is a `blob:` URL (the Dart side
+  /// keeps it as a `needsResolve` placeholder waiting for the real URL —
+  /// no base64 blob bridge). Resource-timing entries
+  /// (`performance.getEntriesByType('resource')`) are scanned too so
+  /// hidden streams missed by `<video>`/`<source>`/anchor markup are still
+  /// surfaced. The media extension set (`mp4|webm|mov|m4v|m3u8|mpd`) matches
+  /// [VideoUrlMatcher.isSupportedMediaUrl].
   ///
   /// Returns a JSON array string.
   static const String videoScanJs = r'''
@@ -266,12 +365,22 @@ function qlFromUrl(u){
   var m=u.match(/(2160|1440|1080|720|480|360|240)p?/i);
   return m?m[1]+'p':'';
 }
+function kindFromUrl(u){
+  if(typeof u!=='string')return 'unknown';
+  var l=u.toLowerCase();
+  if(l.indexOf('blob:')===0)return 'blob';
+  var path=l.split('?')[0].split('#')[0];
+  if(/\.m3u8$/.test(path))return 'hls';
+  if(/\.mpd$/.test(path))return 'dash';
+  if(/\.(mp4|webm|mov|m4v)$/.test(path))return 'direct';
+  return 'unknown';
+}
 function qlFromSource(el){
   var lb=el.getAttribute('label')||el.getAttribute('res')||el.getAttribute('data-res')||'';
   if(lb)return lb.match(/\d+/)?lb.match(/\d+/)[0]+'p':lb;
   return '';
 }
-// --- <video> elements ---
+// --- <video> elements (currentSrc kept even when blob:) ---
 var vs=document.querySelectorAll('video');
 for(var i=0;i<vs.length;i++){
   var v=vs[i];
@@ -292,7 +401,7 @@ for(var i=0;i<vs.length;i++){
     var finalQl=ql||qlFromUrl(urls[u]);
     // videoHeight fallback (often 0 before play, but worth trying)
     if(!finalQl&&v.videoHeight>0)finalQl=v.videoHeight+'p';
-    push({url:urls[u],title:ptitle,ql:finalQl,tSrc:pSrc});
+    push({url:urls[u],title:ptitle,ql:finalQl,tSrc:pSrc,kind:kindFromUrl(urls[u])});
   }
 }
 // --- standalone <source> tags ---
@@ -301,17 +410,28 @@ for(var j=0;j<ss.length;j++){
   var src=ss[j].src||'';
   if(!src)continue;
   var q=qlFromSource(ss[j])||qlFromUrl(src);
-  push({url:src,title:document.title||'',ql:q,tSrc:'doc'});
+  push({url:src,title:document.title||'',ql:q,tSrc:'doc',kind:kindFromUrl(src)});
 }
 // --- direct video anchors ---
 var as=document.querySelectorAll('a[href]');
 for(var k=0;k<as.length;k++){
   var h=as[k].href||'';
-  if(/\.(mp4|webm)(\?|#|$)/i.test(h)){
+  if(/\.(mp4|webm|mov|m4v|m3u8|mpd)(\?|#|$)/i.test(h)){
     var aText=(as[k].textContent||'').trim();
-    push({url:h,title:aText||document.title||'',ql:qlFromUrl(h),tSrc:aText?'anchor':'doc'});
+    push({url:h,title:aText||document.title||'',ql:qlFromUrl(h),tSrc:aText?'anchor':'doc',kind:kindFromUrl(h)});
   }
 }
+// --- resource-timing entries (hidden streams) ---
+try{
+  var rs=(performance&&performance.getEntriesByType)?performance.getEntriesByType('resource'):[];
+  for(var r=0;r<rs.length;r++){
+    var name=rs[r]&&rs[r].name||'';
+    if(!name||seen[name])continue;
+    if(/\.(mp4|webm|mov|m4v|m3u8|mpd)(\?|#|$)/i.test(name)){
+      push({url:name,title:document.title||'',ql:qlFromUrl(name),tSrc:'doc',kind:kindFromUrl(name)});
+    }
+  }
+}catch(e){}
 return JSON.stringify(out);
 }catch(e){return '[]';}})();
 ''';

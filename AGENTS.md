@@ -3,7 +3,7 @@
 ## Project overview
 
 - Flutter Android app: an in-app Chromium browser (`flutter_inappwebview`) with best-effort video URL detection (network interception + fetch/XHR hook + DOM scan) and one-tap download to the Android Downloads directory (MediaStore via platform channel).
-- MVP scope is direct `.mp4` / `.webm` files only; HLS/DASH (`.m3u8`/`.mpd`), DRM, and iOS are explicitly out of scope.
+- MVP scope: any http(s) link accepted with auto-open+detect; direct mp4/webm/mov/m4v + unencrypted HLS VOD supported; encrypted/DRM/live explicitly rejected with message; Facebook/YouTube best-effort via sniffed progressive/HLS; no extractor backend; no ffmpeg in MVP. iOS is out of scope.
 - Primary users: Android users saving public direct-link videos. Main features: `BrowserPage` (address bar, WebView, video picker bottom-sheet, download FAB/progress), manual "paste URL" fallback, background HEAD enrichment (size), quality/title labels, and `ACTION_SEND` share-intent receiving (cold start + hot resume).
 
 ## Tech stack

@@ -15,6 +15,32 @@ import 'package:downloader/presentation/widgets/video_picker_tile.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
+/// Chrome-on-Android user agent sent by the in-app browser.
+///
+/// The default WebView UA contains a `wv` token that bot checks on sites
+/// like Facebook reject with `400` / `X-Frame-Options: deny`
+/// (`ERR_BLOCKED_BY_RESPONSE`). Sending a stock Chrome-mobile UA makes the
+/// server respond with the normal mobile site instead.
+const String kChromeMobileUserAgent =
+    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36';
+
+/// Returns the `m.facebook.com` equivalent of a `www.facebook.com` URL.
+///
+/// The mobile host is served with fewer bot checks and renders better in a
+/// WebView. Returns null for non-Facebook URLs or unparsable input.
+String? facebookMobileFallback(String url) {
+  try {
+    final Uri uri = Uri.parse(url.trim());
+    if (uri.host.toLowerCase() == 'www.facebook.com') {
+      return uri.replace(host: 'm.facebook.com').toString();
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /// Single-screen in-app browser with best-effort video detection + download.
 ///
 /// Follows Clean Architecture: depends only on domain abstractions
@@ -59,11 +85,19 @@ class _BrowserPageState extends State<BrowserPage> {
   StreamSubscription<DownloadRequest>? _detectSub;
   StreamSubscription<String>? _shareSub;
   double _pageProgress = 0;
+
+  /// Last main-frame load failure, shown as a retry banner.
+  ///
+  /// Covers blocked responses (e.g. Facebook rejecting the default WebView
+  /// UA) and HTTP errors. Cleared when a new navigation starts.
+  String? _pageError;
   double _dlProgress = 0;
   bool _downloading = false;
   String _dlName = '';
   int _dlGen = 0;
   Timer? _scanTimer;
+  Timer? _pasteScanTimeout;
+  int _pasteCandidateCount = -1;
   bool _canGoBack = false;
   bool _canGoForward = false;
 
@@ -87,6 +121,8 @@ class _BrowserPageState extends State<BrowserPage> {
     _shareSub = null;
     _scanTimer?.cancel();
     _scanTimer = null;
+    _pasteScanTimeout?.cancel();
+    _pasteScanTimeout = null;
     _urlCtrl.dispose();
     super.dispose();
   }
@@ -97,8 +133,8 @@ class _BrowserPageState extends State<BrowserPage> {
 
   void _onVideoDetected(DownloadRequest req) {
     if (!mounted) return;
+    final bool isNew = !_candidateMap.containsKey(req.url);
     setState(() {
-      final bool isNew = !_candidateMap.containsKey(req.url);
       _candidateMap[req.url] = req;
       if (isNew) {
         _candidateOrder.add(req.url);
@@ -106,6 +142,12 @@ class _BrowserPageState extends State<BrowserPage> {
       // If not new, the map value is updated in-place so the bottom-sheet
       // picks up the enriched data on next open/rebuild.
     });
+    // A genuinely new candidate cancels a pending manual-paste scan timeout.
+    if (isNew && _pasteScanTimeout != null) {
+      _pasteScanTimeout?.cancel();
+      _pasteScanTimeout = null;
+      _pasteCandidateCount = -1;
+    }
   }
 
   void _onSharedUrlReceived(String url) {
@@ -226,13 +268,60 @@ class _BrowserPageState extends State<BrowserPage> {
   Future<void> _onManualPaste() async {
     final String? pasted = await ManualUrlDialog.show(
       context,
-      validator: (url) => VideoUrlMatcher.isVideoUrl(url),
-      errorMessage: 'Enter a direct .mp4 or .webm link',
+      validator: VideoUrlMatcher.isPageUrl,
+      errorMessage: 'Enter a valid http(s) link',
     );
     if (pasted == null) return;
     final String url = pasted.trim();
     if (url.isEmpty) return;
-    widget.detector.addManualUrl(url);
+    if (_looksDownloadable(url)) {
+      widget.detector.addManualUrl(url);
+      return;
+    }
+    // Page link: auto-open in the WebView and scan for videos with a
+    // 25s timeout.
+    final int countAtPaste = _candidateMap.length;
+    _urlCtrl.text = url;
+    _loadUrl(url);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Scanning page for videos...')),
+    );
+    _pasteScanTimeout?.cancel();
+    _pasteCandidateCount = countAtPaste;
+    _pasteScanTimeout = Timer(const Duration(seconds: 25), () {
+      _pasteScanTimeout = null;
+      if (!mounted) return;
+      // Only report "not found" when no new candidate arrived since paste.
+      if (_pasteCandidateCount >= 0 &&
+          _candidateMap.length <= _pasteCandidateCount) {
+        _pasteCandidateCount = -1;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('No downloadable video found'),
+            action: SnackBarAction(label: 'Dismiss', onPressed: () {}),
+          ),
+        );
+      } else {
+        _pasteCandidateCount = -1;
+      }
+    });
+  }
+
+  /// Best-effort downloadable check with a local [Uri] fallback so this
+  /// file compiles regardless of A2 landing order.
+  ///
+  /// TODO: simplify once A2 lands (keep direct
+  /// `VideoUrlMatcher.looksDownloadable(url)` call only).
+  static bool _looksDownloadable(String url) {
+    try {
+      return VideoUrlMatcher.looksDownloadable(url);
+    } catch (_) {
+      final Uri? uri = Uri.tryParse(url.trim());
+      if (uri == null) return false;
+      final String path = uri.path.toLowerCase();
+      return path.endsWith('.mp4') || path.endsWith('.webm');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -257,11 +346,31 @@ class _BrowserPageState extends State<BrowserPage> {
               expand: false,
               builder:
                   (BuildContext ctx, ScrollController scrollCtrl) {
-                // Take a snapshot of candidates at sheet-open time.
+                // Take a snapshot of candidates at sheet-open time, then
+                // partition into immediately downloadable vs still resolving
+                // (opaque blob URLs / placeholders awaiting resolution).
                 final List<DownloadRequest> candidates = _candidateOrder
                     .map((url) => _candidateMap[url])
                     .whereType<DownloadRequest>()
                     .toList();
+                final List<DownloadRequest> downloadable = candidates
+                    .where((DownloadRequest req) =>
+                        !req.needsResolve && req.kind != VideoKind.blob)
+                    .toList();
+                final List<DownloadRequest> resolving = candidates
+                    .where((DownloadRequest req) =>
+                        req.needsResolve || req.kind == VideoKind.blob)
+                    .toList();
+                // Actionable items first, resolving placeholders last.
+                final List<DownloadRequest> ordered = <DownloadRequest>[
+                  ...downloadable,
+                  ...resolving,
+                ];
+                final bool allResolving =
+                    candidates.isNotEmpty && downloadable.isEmpty;
+                final String headerText = allResolving
+                    ? 'Looking for video…'
+                    : 'Videos found (${candidates.length})';
 
                 return Column(
                   children: <Widget>[
@@ -286,7 +395,7 @@ class _BrowserPageState extends State<BrowserPage> {
                         children: <Widget>[
                           Expanded(
                             child: Text(
-                              'Videos found (${candidates.length})',
+                              headerText,
                               style: Theme.of(sheetContext)
                                   .textTheme
                                   .titleSmall,
@@ -305,9 +414,20 @@ class _BrowserPageState extends State<BrowserPage> {
                       child: ListView.builder(
                         controller: scrollCtrl,
                         padding: const EdgeInsets.only(bottom: 16),
-                        itemCount: candidates.length,
+                        itemCount: ordered.length,
                         itemBuilder: (BuildContext _, int index) {
-                          final DownloadRequest req = candidates[index];
+                          final DownloadRequest req = ordered[index];
+                          final bool isResolving =
+                              req.needsResolve ||
+                                  req.kind == VideoKind.blob;
+                          if (isResolving) {
+                            return VideoPickerTile(
+                              request: req,
+                              onDownload: () {},
+                              enabled: false,
+                              subtitleOverride: 'Resolving stream…',
+                            );
+                          }
                           return VideoPickerTile(
                             request: req,
                             onDownload: () {
@@ -333,6 +453,11 @@ class _BrowserPageState extends State<BrowserPage> {
   // ---------------------------------------------------------------------------
 
   Future<void> _startDownload(DownloadRequest req) async {
+    if (req.kind == VideoKind.hls && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Downloading stream…')),
+      );
+    }
     setState(() {
       _downloading = true;
       _dlProgress = 0;
@@ -387,6 +512,42 @@ class _BrowserPageState extends State<BrowserPage> {
     setState(() => _downloading = false);
   }
 
+  /// Banner shown when the main frame fails to load (blocked response,
+  /// HTTP error, no connectivity).
+  ///
+  /// Offers Retry plus, for Facebook links, a switch to the mobile host
+  /// which is served with fewer bot checks.
+  Widget _buildPageErrorBanner() {
+    final String? fallback = facebookMobileFallback(_urlCtrl.text);
+    return Container(
+      width: double.infinity,
+      color: Theme.of(context).colorScheme.errorContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Text(
+              _pageError ?? 'Page failed to load',
+              style: Theme.of(context).textTheme.bodySmall,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          TextButton(
+            onPressed: () =>
+                unawaited(_webCtrl?.reload() ?? Future<void>.value()),
+            child: const Text('Retry'),
+          ),
+          if (fallback != null)
+            TextButton(
+              onPressed: () => _loadUrl(fallback),
+              child: const Text('Mobile site'),
+            ),
+        ],
+      ),
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Build
   // ---------------------------------------------------------------------------
@@ -408,6 +569,7 @@ class _BrowserPageState extends State<BrowserPage> {
             ),
             if (_pageProgress < 1)
               LinearProgressIndicator(value: _pageProgress),
+            if (_pageError != null) _buildPageErrorBanner(),
             Expanded(
               child: InAppWebView(
                 initialUrlRequest:
@@ -421,6 +583,16 @@ class _BrowserPageState extends State<BrowserPage> {
                   mediaPlaybackRequiresUserGesture: false,
                   javaScriptEnabled: true,
                   domStorageEnabled: true,
+                  // Sites with bot checks (e.g. Facebook) block the default
+                  // WebView UA; send stock Chrome-mobile instead. Third-party
+                  // cookies keep logged-in sessions working. No cleartext is
+                  // allowed — HTTPS-only is unchanged.
+                  userAgent: kChromeMobileUserAgent,
+                  thirdPartyCookiesEnabled: true,
+                  useWideViewPort: true,
+                  loadWithOverviewMode: true,
+                  databaseEnabled: true,
+                  cacheEnabled: true,
                 ),
                 onWebViewCreated: (controller) {
                   _webCtrl = controller;
@@ -440,6 +612,12 @@ class _BrowserPageState extends State<BrowserPage> {
                       },
                     );
                   } catch (_) {}
+                },
+                onLoadStart: (controller, url) {
+                  if (!mounted) return;
+                  if (_pageError != null) {
+                    setState(() => _pageError = null);
+                  }
                 },
                 onUpdateVisitedHistory: (controller, url, isReload) {
                   if (url != null) {
@@ -473,6 +651,28 @@ class _BrowserPageState extends State<BrowserPage> {
                 onProgressChanged: (controller, progress) {
                   if (!mounted) return;
                   setState(() => _pageProgress = progress / 100);
+                },
+                onReceivedError: (controller, request, error) {
+                  try {
+                    if ((request.isForMainFrame ?? false) && mounted) {
+                      setState(() {
+                        _pageError =
+                            'Page failed to load (${error.description})';
+                      });
+                    }
+                  } catch (_) {}
+                },
+                onReceivedHttpError: (controller, request, errorResponse) {
+                  try {
+                    if ((request.isForMainFrame ?? false) && mounted) {
+                      final int? status = errorResponse.statusCode;
+                      if (status != null && status >= 400) {
+                        setState(() {
+                          _pageError = 'Page failed to load (HTTP $status)';
+                        });
+                      }
+                    }
+                  } catch (_) {}
                 },
                 onLoadStop: (controller, url) async {
                   try {
