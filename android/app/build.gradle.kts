@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.downloader"
-    compileSdk = 34
+    compileSdk = 36
     // ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -46,4 +46,18 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// Workaround: receive_sharing_intent 1.9.0 declares `compileSdk 37`, but the
+// only published Platform 37 package ("37.0") ships metadata AGP cannot
+// resolve as android-37. The plugin uses no API above 33, so pin it to the
+// installed SDK 36 instead of failing the whole build.
+rootProject.subprojects {
+    if (name == "receive_sharing_intent") {
+        afterEvaluate {
+            extensions.configure<com.android.build.api.dsl.LibraryExtension> {
+                compileSdk = 36
+            }
+        }
+    }
 }
