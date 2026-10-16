@@ -19,7 +19,7 @@
 - `lib/domain/` — pure Dart, zero Flutter/infrastructure imports. Entities (`download_request.dart`), pure helpers (`video_url_matcher.dart`), interfaces (`i_video_detector.dart`, `i_file_downloader.dart`, `i_storage_gateway.dart`, `i_receive_share_gateway.dart`), use cases (`detect_video_use_case.dart`, `download_video_use_case.dart`). Agents: prefer working here for business rules.
 - `lib/infrastructure/` — implements domain interfaces: `webview_video_sniffer.dart` (detection, `fetchHookJs`/`videoScanJs`, HEAD enrichment), `dio_download_service.dart`, `media_store_gateway.dart`, `webview_cookie_bridge.dart`, `receive_share_gateway.dart`.
 - `lib/presentation/` — `browser_page.dart` + `widgets/` (`address_bar.dart`, `animated_download_fab.dart`, `download_progress_bar.dart`, `manual_url_dialog.dart`, `video_picker_tile.dart`). Depends only on domain abstractions.
-- `android/app/src/main/` — `AndroidManifest.xml` (INTERNET, `ACTION_SEND` text/plain intent-filter), `kotlin/.../MainActivity.kt`, `MediaStoreHelper.kt`. `test/widget_test.dart` — only test file. Docs: `pr_plan.md`. `setup_android_minimal.ps1` — Windows Android SDK/JDK bootstrap.
+- `android/app/src/main/` — `AndroidManifest.xml` (INTERNET, `ACTION_SEND` text/plain intent-filter), `kotlin/.../MainActivity.kt`, `MediaStoreHelper.kt`. tests in `test/` (`widget_test.dart`, `video_url_matcher_test.dart`, `webview_video_sniffer_test.dart`, `download_video_use_case_test.dart`, `hls_parser_test.dart`, `page_load_fallback_test.dart`). Docs: `pr_plan.md`. `setup_android_minimal.ps1` — Windows Android SDK/JDK bootstrap.
 
 ## Setup and commands
 
@@ -69,8 +69,8 @@ Environment variables: none required by the app (no `.env`, no `--dart-define`).
 
 ## Testing requirements
 
-- Runner: `flutter test` (i.e. `package:flutter_test`). Location: `test/`; current file: `test/widget_test.dart`; naming: `*_test.dart`.
-- What to test: `VideoUrlMatcher` pure cases (extension before query, case-insensitive path, blob/data rejection, false-positive blocklist, dedup normalization, filename suggestion), `DownloadRequest` invariants (original URL preserved exactly), sniffer dedup/merge behavior, `DetectVideoUseCase` filtering, `ReceiveShareGateway.extractFirstUrl` (bare URL, `"Title https://..."`, trailing punctuation, no-URL → null), title generic→specific upgrade and no-downgrade.
+- Runner: `flutter test` (i.e. `package:flutter_test`). Location: `test/`; naming: `*_test.dart`.
+- What to test: `VideoUrlMatcher` pure cases (extension before query, case-insensitive path, blob/data rejection, false-positive blocklist, dedup normalization, filename suggestion, manifest→`.mp4` mapping, `alignFileNameWithContainer`, `shouldProbeMetadata` gating), `DownloadRequest` invariants (original URL preserved exactly), sniffer dedup/merge behavior and HEAD-probe gating (fake Dio adapter), `DetectVideoUseCase` filtering, `DownloadVideoUseCase` routing (HLS container naming, direct, blob fail-fast, save failure), `HlsPlaylist` parsing/rejection signals, `ReceiveShareGateway.extractFirstUrl` (bare URL, `"Title https://..."`, trailing punctuation, no-URL → null), title generic→specific upgrade and no-downgrade.
 - Mocks/fakes: construct `WebViewVideoSniffer()` directly (optionally `dio:` injection); no mockito/mocktail in repo — hand-rolled fakes over new test dependencies.
 - Gate: `flutter analyze` clean + `flutter test` all-pass before a change is complete. Coverage: no threshold configured (see TODO). New/updated tests are required for every behavior change and bug fix.
 

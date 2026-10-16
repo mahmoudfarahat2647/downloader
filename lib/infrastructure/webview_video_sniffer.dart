@@ -112,8 +112,12 @@ class WebViewVideoSniffer implements IVideoDetector {
       _controller.add(req);
 
       // Fire a background HEAD request to fill in contentLength if missing.
-      // Skipped for blob: placeholders (not fetchable over HTTP).
-      if (req.contentLength == null && !isBlob) {
+      // Skipped for blob: placeholders (not fetchable over HTTP) and for URLs
+      // that are definitely not media (css/js/images), so a single page load
+      // does not fan out into hundreds of HEAD requests.
+      if (req.contentLength == null &&
+          !isBlob &&
+          VideoUrlMatcher.shouldProbeMetadata(trimmed, nonEmptyContentType)) {
         _fetchMetadataInBackground(key, trimmed, headers);
       }
       return true;

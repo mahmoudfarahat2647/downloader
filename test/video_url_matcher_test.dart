@@ -243,4 +243,176 @@ void main() {
       );
     });
   });
+
+  group('VideoUrlMatcher.shouldProbeMetadata', () {
+    test('skips ordinary page assets', () {
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata('https://site.example.com/app.css'),
+        isFalse,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://site.example.com/bundle.js',
+        ),
+        isFalse,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://site.example.com/thumb.jpg',
+        ),
+        isFalse,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://site.example.com/font.woff2',
+        ),
+        isFalse,
+      );
+    });
+
+    test('probes known media URLs', () {
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata('https://cdn.example.com/a.mp4'),
+        isTrue,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://cdn.example.com/stream/master.m3u8',
+        ),
+        isTrue,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://cdn.example.com/stream/manifest.mpd',
+        ),
+        isTrue,
+      );
+    });
+
+    test('probes extensionless delivery URLs', () {
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://video.fbcn1.fbcdn.net/v/12345?token=abc',
+        ),
+        isTrue,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://example.com/delivery/abc123',
+          'application/x-mpegURL',
+        ),
+        isTrue,
+      );
+    });
+
+    test('skips ad/tracker URLs even when extensionless', () {
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://doubleclick.net/delivery/12345',
+        ),
+        isFalse,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata(
+          'https://example.com/beacon/collect',
+        ),
+        isFalse,
+      );
+    });
+
+    test('skips non-http schemes and empty input', () {
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata('blob:https://example.com/x'),
+        isFalse,
+      );
+      expect(
+        VideoUrlMatcher.shouldProbeMetadata('data:video/mp4;base64,AAAA'),
+        isFalse,
+      );
+      expect(VideoUrlMatcher.shouldProbeMetadata(''), isFalse);
+    });
+  });
+
+  group('VideoUrlMatcher.suggestFileName manifests and containers', () {
+    test('replaces a .m3u8 manifest extension with .mp4', () {
+      expect(
+        VideoUrlMatcher.suggestFileName(
+          'https://cdn.example.com/hls/stream.m3u8',
+        ),
+        'stream.mp4',
+      );
+      expect(
+        VideoUrlMatcher.suggestFileName(
+          'https://cdn.example.com/hls/master.m3u8?token=1',
+        ),
+        'master.mp4',
+      );
+    });
+
+    test('replaces a .mpd manifest extension with .mp4', () {
+      expect(
+        VideoUrlMatcher.suggestFileName(
+          'https://cdn.example.com/dash/manifest.mpd',
+        ),
+        'manifest.mp4',
+      );
+    });
+
+    test('preserves real media containers', () {
+      expect(
+        VideoUrlMatcher.suggestFileName('https://cdn.example.com/clip.mov'),
+        'clip.mov',
+      );
+      expect(
+        VideoUrlMatcher.suggestFileName('https://cdn.example.com/clip.m4v'),
+        'clip.m4v',
+      );
+    });
+  });
+
+  group('VideoUrlMatcher.alignFileNameWithContainer', () {
+    test('rewrites .mp4 to .ts for an MPEG-TS temp file', () {
+      expect(
+        VideoUrlMatcher.alignFileNameWithContainer(
+          'stream.mp4',
+          '/tmp/vd_hls_1.ts',
+        ),
+        'stream.ts',
+      );
+    });
+
+    test('strips a manifest extension left in the suggestion', () {
+      expect(
+        VideoUrlMatcher.alignFileNameWithContainer(
+          'stream.m3u8.mp4',
+          '/tmp/vd_hls_1.ts',
+        ),
+        'stream.ts',
+      );
+    });
+
+    test('keeps .mp4 for an fMP4 temp file', () {
+      expect(
+        VideoUrlMatcher.alignFileNameWithContainer(
+          'stream.mp4',
+          '/tmp/vd_hls_2.mp4',
+        ),
+        'stream.mp4',
+      );
+    });
+
+    test('keeps the suggestion when the temp file has no extension', () {
+      expect(
+        VideoUrlMatcher.alignFileNameWithContainer('video.mp4', '/tmp/noext'),
+        'video.mp4',
+      );
+    });
+
+    test('falls back to video.<ext> when the suggestion is empty', () {
+      expect(
+        VideoUrlMatcher.alignFileNameWithContainer('', '/tmp/a.ts'),
+        'video.ts',
+      );
+    });
+  });
 }

@@ -82,11 +82,18 @@ class MediaStoreGateway implements IStorageGateway {
 
   static String _mimeTypeFor(String fileName) {
     final String lower = fileName.toLowerCase();
-    if (lower.endsWith('.mp4')) {
+    if (lower.endsWith('.mp4') || lower.endsWith('.m4v')) {
       return 'video/mp4';
     }
     if (lower.endsWith('.webm')) {
       return 'video/webm';
+    }
+    if (lower.endsWith('.mov')) {
+      return 'video/quicktime';
+    }
+    // MPEG-TS output from an HLS download (no fMP4 init segment).
+    if (lower.endsWith('.ts')) {
+      return 'video/mp2t';
     }
     return 'application/octet-stream';
   }

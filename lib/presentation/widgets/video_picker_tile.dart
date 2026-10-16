@@ -44,7 +44,7 @@ class VideoPickerTile extends StatelessWidget {
 
     final String? sizeLabel = _formatSize(request.contentLength);
     final String? qualityLabel = request.qualityLabel;
-    final String? formatLabel = _formatBadge(request.suggestedFileName);
+    final String? formatLabel = _formatBadge(request);
 
     final String subtitle = subtitleOverride ?? request.url;
 
@@ -180,7 +180,18 @@ class VideoPickerTile extends StatelessWidget {
     return '$bytes B';
   }
 
-  static String? _formatBadge(String fileName) {
+  static String? _formatBadge(DownloadRequest request) {
+    // Streams: show the protocol rather than a guessed file extension (the
+    // real container — MPEG-TS vs fMP4 — is only known after fetching).
+    switch (request.kind) {
+      case VideoKind.hls:
+        return 'HLS';
+      case VideoKind.dash:
+        return 'DASH';
+      default:
+        break;
+    }
+    final String fileName = request.suggestedFileName;
     final int dot = fileName.lastIndexOf('.');
     if (dot < 0 || dot == fileName.length - 1) return null;
     return fileName.substring(dot + 1).toUpperCase();

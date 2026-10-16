@@ -104,10 +104,51 @@ class VideoUrlMatcher {
     }
     final String sanitized = segment.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
     final String lower = sanitized.toLowerCase();
-    if (lower.endsWith('.mp4') || lower.endsWith('.webm')) {
+    // Preserve the real media container when the URL already carries one.
+    if (lower.endsWith('.mp4') ||
+        lower.endsWith('.webm') ||
+        lower.endsWith('.mov') ||
+        lower.endsWith('.m4v')) {
       return sanitized;
     }
+    // A manifest is not the media itself: `stream.m3u8` → `stream.mp4`. The
+    // HLS downloader later rewrites the extension to the real container
+    // (`.ts` for MPEG-TS, `.mp4` for fMP4) via [alignFileNameWithContainer].
+    for (final String manifest in <String>['.m3u8', '.mpd']) {
+      if (lower.endsWith(manifest)) {
+        final String base =
+            sanitized.substring(0, sanitized.length - manifest.length);
+        return base.isEmpty ? sanitized : '$base.mp4';
+      }
+    }
     return '$sanitized.mp4';
+  }
+
+  /// Rewrites [suggestedFileName]'s extension to match the container actually
+  /// written to [tempPath].
+  ///
+  /// Used by the download flow: an HLS request may suggest `stream.mp4` while
+  /// the fetched file is MPEG-TS (`…/vd_hls_123.ts`), so the persisted name
+  /// must follow the temp file (`stream.ts`) instead of mislabelling the bytes.
+  /// A manifest extension left in the name is stripped first
+  /// (`stream.m3u8.mp4` → `stream.ts`). Returns [suggestedFileName] unchanged
+  /// when [tempPath] has no extension.
+  static String alignFileNameWithContainer(
+    String suggestedFileName,
+    String tempPath,
+  ) {
+    final String containerExt = _extensionOf(tempPath);
+    if (containerExt.isEmpty) return suggestedFileName;
+    final String trimmed = suggestedFileName.trim();
+    String base = trimmed.isEmpty ? 'video' : _stripExtension(trimmed);
+    final String lowerBase = base.toLowerCase();
+    if (lowerBase.endsWith('.m3u8')) {
+      base = base.substring(0, base.length - '.m3u8'.length);
+    } else if (lowerBase.endsWith('.mpd')) {
+      base = base.substring(0, base.length - '.mpd'.length);
+    }
+    if (base.isEmpty) base = 'video';
+    return '$base.$containerExt';
   }
 
   /// Heuristic ad/tracker blocklist.
@@ -142,6 +183,32 @@ class VideoUrlMatcher {
   static bool looksDownloadable(String url, [String? contentType]) {
     return isSupportedMediaUrl(url, contentType) &&
         !isLikelyFalsePositive(url);
+  }
+
+  /// Returns true when it is worth issuing a background metadata probe
+  /// (HTTP HEAD) for [url].
+  ///
+  /// True for anything [looksDownloadable] accepts, and — crucially — for
+  /// extensionless `http`/`https` delivery URLs (`https://fbcdn.../v/12345`,
+  /// `googlevideo` style endpoints) whose real content type is only
+  /// discoverable from a HEAD response. False for ordinary page assets
+  /// (`app.css`, `bundle.js`, `thumb.jpg`) and ad/tracker URLs, so a page load
+  /// does not fan out into hundreds of HEAD requests.
+  static bool shouldProbeMetadata(String url, [String? contentType]) {
+    if (looksDownloadable(url, contentType)) return true;
+    try {
+      final String trimmed = url.trim();
+      if (trimmed.isEmpty) return false;
+      final Uri uri = Uri.parse(trimmed);
+      final String scheme = uri.scheme.toLowerCase();
+      if (scheme != 'http' && scheme != 'https') return false;
+      if (isLikelyFalsePositive(url)) return false;
+      // Only extensionless paths are worth probing: a known extension that is
+      // not media (css/js/jpg/…) is definitively not a downloadable video.
+      return _extensionOf(uri.path).isEmpty;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Returns true only for `.m3u8` (HLS) URLs.
@@ -255,5 +322,26 @@ class VideoUrlMatcher {
     } catch (_) {
       return false;
     }
+  }
+
+  /// Returns the lowercase extension (without the dot) of the last path
+  /// segment in [pathOrUrl], or an empty string when there is none.
+  ///
+  /// `https://x/v/12345` → `''`; `https://x/clip.MP4` → `mp4`;
+  /// `/tmp/vd_hls_1.ts` → `ts`.
+  static String _extensionOf(String pathOrUrl) {
+    final int slash = pathOrUrl.lastIndexOf(RegExp(r'[/\\]'));
+    final String last =
+        slash >= 0 ? pathOrUrl.substring(slash + 1) : pathOrUrl;
+    final int dot = last.lastIndexOf('.');
+    if (dot <= 0 || dot == last.length - 1) return '';
+    return last.substring(dot + 1).toLowerCase();
+  }
+
+  /// Strips the trailing extension from [name] (`clip.mov` → `clip`).
+  static String _stripExtension(String name) {
+    final int dot = name.lastIndexOf('.');
+    if (dot <= 0) return name;
+    return name.substring(0, dot);
   }
 }

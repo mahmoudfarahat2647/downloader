@@ -107,7 +107,9 @@ class DownloadVideoUseCase {
   /// Merges [DownloadRequest.headers] with the live session headers from
   /// [headerBuilder] (when provided) so protected playlists keep working.
   /// The service's temp file (`.ts` for MPEG-TS, `.mp4` for fMP4) is
-  /// persisted via [storage] exactly like the direct path.
+  /// persisted via [storage] exactly like the direct path, with the saved
+  /// file name's extension aligned to that container so a TS stream is never
+  /// mislabelled `.mp4`.
   Future<void> _downloadHls(
     DownloadRequest request, {
     required void Function(double) onProgress,
@@ -133,8 +135,13 @@ class DownloadVideoUseCase {
         onProgress: onProgress,
         onComplete: (String tempPath) async {
           try {
-            final String saved =
-                await storage.saveToDownloads(tempPath, request.suggestedFileName);
+            final String saved = await storage.saveToDownloads(
+              tempPath,
+              VideoUrlMatcher.alignFileNameWithContainer(
+                request.suggestedFileName,
+                tempPath,
+              ),
+            );
             onComplete(saved);
           } catch (e) {
             onError('Save failed: $e');
